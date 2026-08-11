@@ -38,7 +38,9 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
+          git stash
           git pull origin main --rebase
+          git stash pop
           git add cnas_monitor_state.json
           git diff --staged --quiet || git commit -m "更新监控状态 [skip ci]"
           git push
