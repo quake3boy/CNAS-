@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CNAS网站最新通知监控脚本 - GitHub Actions版本
+CNAS网站最新通知监控脚本 - GitHub Actions版本（含PDF OCR识别）
 """
 
 import requests
@@ -16,6 +16,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
 from email.utils import formataddr
+import io
+import re
 
 # 邮件配置（从环境变量读取）
 SMTP_SERVER = "smtp.qq.com"
@@ -45,6 +47,15 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Connection": "keep-alive",
 }
+
+# OCR相关（延迟导入，避免没有安装时脚本崩溃）
+OCR_AVAILABLE = False
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    print("提示：OCR相关库未安装，将跳过PDF内容识别")
 
 
 def get_beijing_now():
@@ -83,20 +94,164 @@ def send_email(subject, html_body):
         return False
 
 
+def extract_pdf_text(pdf_content):
+    """用OCR提取PDF文字内容"""
+    if not OCR_AVAILABLE:
+        return None, "OCR工具未安装"
+    
+    try:
+        # PDF转图片
+        images = convert_from_bytes(pdf_content, dpi=200)
+        print(f"PDF共 {len(images)} 页，开始OCR识别...")
+        
+        full_text = ""
+        for i, img in enumerate(images):
+            print(f"正在识别第 {i+1}/{len(images)} 页...")
+            # 中文识别
+            text = pytesseract.image_to_string(img, lang='chi_sim')
+            full_text += text + "\n"
+        
+        # 清理多余空白
+        full_text = re.sub(r'\n{3,}', '\n\n', full_text).strip()
+        print(f"OCR识别完成，共 {len(full_text)} 字")
+        return full_text, None
+    except Exception as e:
+        print(f"OCR识别失败: {e}")
+        return None, str(e)
+
+
+def generate_summary(text, max_length=800):
+    """生成内容摘要（简单提取关键段落）"""
+    if not text:
+        return ""
+    
+    # 去掉多余空白
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    cleaned = '\n'.join(lines)
+    
+    # 如果内容不长，直接返回
+    if len(cleaned) <= max_length:
+        return cleaned
+    
+    # 尝试提取关键信息段落
+    keywords = ['培训', '时间', '地点', '内容', '费用', '报名', '联系', '地址', '方式', '参加', '对象', '课程', '安排']
+    important_lines = []
+    
+    for line in lines:
+        if any(k in line for k in keywords) and len(line) > 5:
+            important_lines.append(line)
+    
+    # 如果有关键段落，优先取这些
+    if important_lines:
+        summary = '\n'.join(important_lines[:15])
+        if len(summary) > max_length:
+            summary = summary[:max_length] + '...'
+        return summary
+    
+    # 否则取前N字
+    return cleaned[:max_length] + '...'
+
+
+def get_notice_detail_and_pdf(notice_url):
+    """访问通知详情页，获取PDF附件和OCR内容"""
+    result = {
+        'pdf_name': None,
+        'pdf_url': None,
+        'pdf_text': None,
+        'pdf_summary': None,
+        'ocr_error': None,
+        'page_text': None
+    }
+    
+    try:
+        resp = requests.get(notice_url, headers=HEADERS, timeout=30)
+        resp.encoding = 'utf-8'
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # 提取页面文字
+        body = soup.find('body')
+        if body:
+            page_text = body.get_text(strip=True)
+            if len(page_text) > 100:
+                result['page_text'] = page_text[:500]
+        
+        # 找PDF链接
+        for a in soup.find_all('a'):
+            href = a.get('href', '')
+            text = a.get_text(strip=True)
+            if '.pdf' in href.lower() or 'download' in href.lower():
+                result['pdf_name'] = text
+                if href.startswith('/'):
+                    result['pdf_url'] = BASE_URL + href
+                else:
+                    result['pdf_url'] = href
+                break
+        
+        # 如果找到PDF，下载并OCR
+        if result['pdf_url'] and OCR_AVAILABLE:
+            print(f"正在下载PDF: {result['pdf_name']}")
+            pdf_resp = requests.get(result['pdf_url'], headers=HEADERS, timeout=60)
+            if pdf_resp.status_code == 200 and len(pdf_resp.content) > 0:
+                print(f"PDF大小: {len(pdf_resp.content)} 字节")
+                text, error = extract_pdf_text(pdf_resp.content)
+                if text:
+                    result['pdf_text'] = text
+                    result['pdf_summary'] = generate_summary(text)
+                else:
+                    result['ocr_error'] = error
+            else:
+                result['ocr_error'] = f"PDF下载失败，状态码: {pdf_resp.status_code}"
+        
+        return result
+    except Exception as e:
+        print(f"获取通知详情失败: {e}")
+        result['ocr_error'] = str(e)
+        return result
+
+
 def send_training_notice_email(training_notices):
-    """发送新培训通知邮件"""
+    """发送新培训通知邮件（含PDF内容摘要）"""
     count = len(training_notices)
     latest_date = training_notices[0]["date"]
     subject = f"【CNAS新培训通知】{count}条新培训通知 - {latest_date}"
 
     items_html = ""
     for i, notice in enumerate(training_notices, 1):
+        title = notice.get("title", "未知标题")
+        date = notice.get("date", "未知日期")
+        url = notice.get("url", "")
+        
+        # 获取PDF内容
+        detail = get_notice_detail_and_pdf(url)
+        
+        # 内容摘要部分
+        summary_html = ""
+        if detail.get('pdf_summary'):
+            summary_html = f"""
+            <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:6px;padding:12px 16px;margin-top:10px;font-size:13px;color:#374151;line-height:1.6;">
+                <div style="font-weight:bold;color:#0369a1;margin-bottom:8px;">📄 内容摘要（OCR识别）</div>
+                <div style="white-space:pre-wrap;">{detail['pdf_summary'][:600]}</div>
+            </div>
+            """
+        elif detail.get('ocr_error'):
+            summary_html = f"""
+            <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;padding:10px 14px;margin-top:10px;font-size:12px;color:#92400e;">
+                ⚠️ PDF内容识别失败：{detail['ocr_error'][:100]}
+            </div>
+            """
+        
+        pdf_info = ""
+        if detail.get('pdf_name'):
+            pdf_info = f'<div style="font-size:12px;color:#6b7280;margin-top:6px;">附件：{detail["pdf_name"]}</div>'
+        
         items_html += f"""
-            <div style="background:white;border:1px solid #e5e7eb;border-radius:6px;padding:16px 20px;margin-bottom:12px;border-left:4px solid #3b82f6;">
+            <div style="background:white;border:1px solid #e5e7eb;border-radius:6px;padding:16px 20px;margin-bottom:16px;border-left:4px solid #3b82f6;">
                 <div style="font-size:16px;font-weight:bold;margin-bottom:8px;">
-                    <a href="{notice['url']}" target="_blank" style="color:#1a56db;text-decoration:none;">{i}. {notice['title']}</a>
+                    <a href="{url}" target="_blank" style="color:#1a56db;text-decoration:none;">{i}. {title}</a>
                 </div>
-                <div style="font-size:13px;color:#6b7280;">发布日期：{notice['date']}</div>
+                <div style="font-size:13px;color:#6b7280;">发布日期：{date}</div>
+                {pdf_info}
+                {summary_html}
             </div>
         """
 
@@ -115,7 +270,8 @@ def send_training_notice_email(training_notices):
                 <a href="https://www.cnas.org.cn/fzlm/tzgg/index.html" target="_blank" style="color:#6b7280;font-size:13px;">查看完整通知列表 →</a>
             </div>
             <div style="margin-top:25px;padding-top:15px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
-                本邮件由CNAS通知监控系统自动发送<br>每天 08:30-17:00 每半小时自动检查（GitHub Actions驱动）
+                本邮件由CNAS通知监控系统自动发送<br>每天 08:30-17:00 每半小时自动检查（GitHub Actions驱动）<br>
+                PDF内容通过OCR识别，可能存在少量识别误差
             </div>
         </div>
     </div>
@@ -297,6 +453,7 @@ def is_last_check_of_day():
 def main():
     print("=" * 50)
     print(f"CNAS通知监控 - {get_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+    print(f"OCR功能: {'已启用' if OCR_AVAILABLE else '未启用'}")
     print("=" * 50)
 
     if not is_within_monitor_hours():
@@ -331,7 +488,7 @@ def main():
             print(f"\n发现 {len(new_notices)} 条新通知")
             training_notices = filter_training_notices(new_notices)
             if training_notices:
-                print(f"其中 {len(training_notices)} 条是培训通知")
+                print(f"其中 {len(training_notices)} 条是培训通知，将获取PDF内容并发送邮件")
                 if send_training_notice_email(training_notices):
                     state["total_training_notices_found"] += len(training_notices)
                     state["last_training_notice_title"] = training_notices[0]["title"]
