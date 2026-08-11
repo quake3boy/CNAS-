@@ -1,0 +1,36 @@
+name: CNAS培训通知监控
+
+on:
+  schedule:
+    - cron: '0,30 0-9 * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖
+        run: pip install requests beautifulsoup4
+
+      - name: 运行监控脚本
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python cnas_monitor.py
+
+      - name: 提交状态文件更新
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add cnas_monitor_state.json
+          git diff --staged --quiet || git commit -m "更新监控状态 [skip ci]"
+          git push
