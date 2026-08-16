@@ -1,5 +1,4 @@
 name: CNAS培训通知监控
-
 on:
   schedule:
     - cron: '0 1,4,7,10,10 * * *'
