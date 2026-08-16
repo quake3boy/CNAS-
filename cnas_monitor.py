@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 CNAS网站最新通知监控脚本 - GitHub Actions版本（含PDF OCR识别+原版图片）
+适配yml传入RUN_BEIJING_HOUR环境变量，固定班次9/12/15/18，仅18点发每日汇总
 """
 import requests
 from bs4 import BeautifulSoup
@@ -34,12 +35,8 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnas_moni
 # 北京时间
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# 监控时间范围（北京时间）
-START_HOUR = 8
-START_MINUTE = 30
-END_HOUR = 19
-END_MINUTE = 0
-LAST_CHECK_HOUR = 17
+# 读取yml传入的班次环境变量：9 /12 /15 /18 / manual
+RUN_BEIJING_HOUR = os.environ.get("RUN_BEIJING_HOUR", "manual")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -61,15 +58,6 @@ except ImportError:
 def get_beijing_now():
     """获取北京时间"""
     return datetime.now(BEIJING_TZ)
-
-
-def is_within_monitor_hours():
-    """判断当前是否在监控时间段内（北京时间8:30-18:00）"""
-    now = get_beijing_now()
-    current_minutes = now.hour * 60 + now.minute
-    start_minutes = START_HOUR * 60 + START_MINUTE
-    end_minutes = END_HOUR * 60 + END_MINUTE
-    return start_minutes <= current_minutes <= end_minutes
 
 
 def send_email(subject, html_body):
@@ -103,15 +91,15 @@ def extract_pdf_content(pdf_content):
     """用OCR提取PDF文字内容，同时返回每页图片的base64"""
     if not OCR_AVAILABLE:
         return None, [], "OCR工具未安装"
-    
+
     try:
         # PDF转图片（dpi=150平衡清晰度和文件大小）
         images = convert_from_bytes(pdf_content, dpi=150)
         print(f"PDF共 {len(images)} 页，开始OCR识别...")
-        
+
         full_text = ""
         page_images = []
-        
+
         for i, img in enumerate(images):
             print(f"正在识别第 {i+1}/{len(images)} 页...")
             # 中文识别
@@ -119,12 +107,12 @@ def extract_pdf_content(pdf_content):
             if i > 0:
                 full_text += f"\n\n========== 第 {i+1} 页 ==========\n\n"
             full_text += text
-            
+
             # 图片转base64（质量75%控制邮件大小）
             img_b64 = image_to_base64(img, quality=75)
             page_images.append(img_b64)
             print(f"  第{i+1}页图片大小: {len(img_b64)//1024}KB")
-        
+
         # 清理多余空行
         full_text = re.sub(r'\n{4,}', '\n\n\n', full_text).strip()
         print(f"OCR识别完成，共 {len(full_text)} 字，{len(page_images)} 页图片")
@@ -145,13 +133,13 @@ def extract_key_info(text):
         '联系方式': '',
         '参加对象': '',
     }
-    
+
     if not text:
         return info
-    
+
     # 按行分割，清理
     lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
+
     # 关键词匹配模式
     patterns = {
         '培训时间': [r'培训时间[：:]\s*(.+)', r'时间[：:]\s*(.+)', r'举办时间[：:]\s*(.+)'],
@@ -162,7 +150,7 @@ def extract_key_info(text):
         '联系方式': [r'联系方式[：:]\s*(.+)', r'联系电话[：:]\s*(.+)', r'联系人[：:]\s*(.+)', r'电话[：:]\s*(.+)'],
         '参加对象': [r'参加对象[：:]\s*(.+)', r'培训对象[：:]\s*(.+)', r'对象[：:]\s*(.+)'],
     }
-    
+
     for key, regex_list in patterns.items():
         for line in lines:
             for pattern in regex_list:
@@ -174,7 +162,7 @@ def extract_key_info(text):
                         break
             if info[key]:
                 break
-    
+
     return info
 
 
@@ -190,19 +178,19 @@ def get_notice_detail_and_pdf(notice_url):
         'ocr_error': None,
         'page_text': None
     }
-    
+
     try:
         resp = requests.get(notice_url, headers=HEADERS, timeout=30)
         resp.encoding = 'utf-8'
         soup = BeautifulSoup(resp.text, 'html.parser')
-        
+
         # 提取页面文字
         body = soup.find('body')
         if body:
             page_text = body.get_text(strip=True)
             if len(page_text) > 100:
                 result['page_text'] = page_text[:500]
-        
+
         # 找PDF链接
         for a in soup.find_all('a'):
             href = a.get('href', '')
@@ -214,7 +202,7 @@ def get_notice_detail_and_pdf(notice_url):
                 else:
                     result['pdf_url'] = href
                 break
-        
+
         # 如果找到PDF，下载并OCR
         if result['pdf_url'] and OCR_AVAILABLE:
             print(f"正在下载PDF: {result['pdf_name']}")
@@ -231,7 +219,7 @@ def get_notice_detail_and_pdf(notice_url):
                     result['ocr_error'] = error
             else:
                 result['ocr_error'] = f"PDF下载失败，状态码: {pdf_resp.status_code}"
-        
+
         return result
     except Exception as e:
         print(f"获取通知详情失败: {e}")
@@ -245,15 +233,15 @@ def send_training_notice_email(training_notices):
     latest_date = training_notices[0]["date"]
     subject = f"【CNAS新培训通知】{count}条新培训通知 - {latest_date}"
     items_html = ""
-    
+
     for i, notice in enumerate(training_notices, 1):
         title = notice.get("title", "未知标题")
         date = notice.get("date", "未知日期")
         url = notice.get("url", "")
-        
+
         # 获取PDF内容
         detail = get_notice_detail_and_pdf(url)
-        
+
         # 关键信息卡片
         key_info_html = ""
         key_info = detail.get('key_info', {})
@@ -273,7 +261,7 @@ def send_training_notice_email(training_notices):
                 <table style="width:100%;border-collapse:collapse;font-size:13px;">{info_rows}</table>
             </div>
             """
-        
+
         # PDF原版图片
         images_html = ""
         page_images = detail.get('page_images', [])
@@ -292,7 +280,7 @@ def send_training_notice_email(training_notices):
                 {imgs}
             </div>
             """
-        
+
         # OCR完整文字（折叠在底部，供复制）
         ocr_text_html = ""
         if detail.get('pdf_summary'):
@@ -310,11 +298,11 @@ def send_training_notice_email(training_notices):
                 ⚠️ OCR文字识别失败：{detail['ocr_error'][:100]}
             </div>
             """
-        
+
         pdf_info = ""
         if detail.get('pdf_name'):
             pdf_info = f'<div style="font-size:12px;color:#6b7280;margin-top:6px;">附件：{detail["pdf_name"]}</div>'
-        
+
         items_html += f"""
             <div style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:18px 22px;margin-bottom:20px;border-left:4px solid #3b82f6;">
                 <div style="font-size:17px;font-weight:bold;margin-bottom:8px;">
@@ -327,7 +315,7 @@ def send_training_notice_email(training_notices):
                 {ocr_text_html}
             </div>
         """
-    
+
     html_body = f"""
     <div style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:720px;margin:0 auto;padding:20px;color:#333;">
         <div style="background:linear-gradient(135deg,#1a56db,#3b82f6);color:white;padding:22px 30px;border-radius:8px 8px 0 0;">
@@ -343,7 +331,7 @@ def send_training_notice_email(training_notices):
                 <a href="https://www.cnas.org.cn/fzlm/tzgg/index.html" target="_blank" style="color:#6b7280;font-size:13px;">查看完整通知列表 →</a>
             </div>
             <div style="margin-top:25px;padding-top:15px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
-                本邮件由CNAS通知监控系统自动发送<br>每天 08:30-18:00 每半小时自动检查（GitHub Actions驱动）<br>
+                本邮件由CNAS通知监控系统自动发送<br>每日固定班次：09:05 /12:05 /15:05 /18:05<br>
                 PDF原版图片直接嵌入邮件，OCR文字供复制搜索使用
             </div>
         </div>
@@ -384,7 +372,7 @@ def send_daily_summary_email(total_checks_today):
                 <a href="https://www.cnas.org.cn/fzlm/tzgg/index.html" target="_blank" style="color:#6b7280;font-size:13px;">前往CNAS官网查看全部通知 →</a>
             </div>
             <div style="margin-top:25px;padding-top:15px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
-                本邮件由CNAS通知监控系统自动发送<br>每天 08:30-18:00 每半小时自动检查（GitHub Actions驱动）
+                本邮件由CNAS通知监控系统自动发送<br>每日固定班次：09:05 /12:05 /15:05 /18:05
             </div>
         </div>
     </div>
@@ -516,41 +504,33 @@ def filter_training_notices(notices):
     return [n for n in notices if any(k in n["title"] for k in keywords)]
 
 
-def is_last_check_of_day():
-    """判断是否是当天最后一次检查（北京时间18:00）"""
-    return get_beijing_now().hour >= LAST_CHECK_HOUR
-
-
 def main():
     print("=" * 50)
     print(f"CNAS通知监控 - {get_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+    print(f"本次执行班次 RUN_BEIJING_HOUR = {RUN_BEIJING_HOUR}")
     print(f"OCR功能: {'已启用' if OCR_AVAILABLE else '未启用'}")
     print("=" * 50)
-    
-    if not is_within_monitor_hours():
-        print("当前不在监控时间段内（北京时间08:30-18:00），跳过执行")
-        return
-    
+
     today = get_beijing_now().strftime("%Y-%m-%d")
     state = load_state()
-    
+
     try:
         last_check_date = state.get("last_check_time", "")[:10] if state.get("last_check_time") else ""
         if last_check_date != today:
             print("新的一天，重置每日统计")
             state["today_training_found"] = False
             state["today_check_count"] = 0
-        
+
         print(f"上次检查时间: {state.get('last_check_time', '首次运行')}")
         print(f"上次最新通知: {state.get('latest_notice_title', '无')}")
-        
+
         print("\n正在抓取CNAS最新通知...")
         notices = fetch_notices()
         if not notices:
             raise Exception("未能获取通知列表（返回为空）")
         print(f"获取到 {len(notices)} 条通知")
         print(f"最新通知: {notices[0]['title']} ({notices[0]['date']})")
-        
+
         new_notices = find_new_notices(notices, state.get("latest_notice_title", ""))
         if not new_notices:
             print("\n没有新通知")
@@ -566,30 +546,31 @@ def main():
                     state["today_training_found"] = True
             else:
                 print("\n新通知中没有培训通知")
-        
+
         state["last_check_time"] = get_beijing_now().strftime("%Y-%m-%d %H:%M:%S")
         state["latest_notice_title"] = notices[0]["title"]
         state["latest_notice_date"] = notices[0]["date"]
         state["today_check_count"] = state.get("today_check_count", 0) + 1
-        
-        if is_last_check_of_day():
+
+        # 关键点：**由环境变量判断是否为18点班次，不再依赖系统时间**
+        if RUN_BEIJING_HOUR == "18":
             if (state.get("last_summary_date") != today and
-                not state.get("today_training_found", False) and
-                state.get("today_check_count", 0) > 0):
-                print("\n=== 当天最后一次检查，发送每日总结邮件 ===")
+                    not state.get("today_training_found", False) and
+                    state.get("today_check_count", 0) > 0):
+                print("\n=== 18点班次，发送每日总结邮件 ===")
                 if send_daily_summary_email(state["today_check_count"]):
                     state["last_summary_date"] = today
-        
+
         save_state(state)
         print("\n监控完成！")
-    
+
     except Exception as e:
         error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
         print(f"\n监控执行异常: {e}")
         traceback.print_exc()
         # 每次异常都立即发送红色紧急邮件，不限制每天次数
         print("\n=== 检测到异常，立即发送紧急红色邮件 ===")
-        send_error_email(str(e))
+        send_error_email(error_msg)
         state["last_error_date"] = today
         state["last_error_time"] = get_beijing_now().strftime("%Y-%m-%d %H:%M:%S")
         state["last_check_time"] = get_beijing_now().strftime("%Y-%m-%d %H:%M:%S")
