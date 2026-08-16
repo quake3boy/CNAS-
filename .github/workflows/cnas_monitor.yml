@@ -2,9 +2,12 @@ name: CNAS培训通知监控
 
 on:
   schedule:
-    # UTC时间，对应北京时间 08:30-18:00 每半小时
-    # UTC 0:30 = 北京8:30, UTC 10:00 = 北京18:00
-    - cron: '0,30 0-10 * * *'
+    # UTC时间 = 北京时间 -8小时
+    # 北京09:05 → UTC 01:05
+    # 北京12:05 → UTC 04:05
+    # 北京15:05 → UTC 07:05
+    # 北京18:05 → UTC 10:05
+    - cron: '5 1,4,7,10 * * *'
   workflow_dispatch:  # 允许手动触发测试
 
 permissions: write-all
@@ -35,6 +38,15 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          # 标记本次执行对应的北京时间小时，脚本读取这个变量
+          RUN_BEIJING_HOUR: ${{
+              (github.event.schedule == '5 1,4,7,10 * * *') && (
+                  github.event.schedule | split(',')[0] == '5 1' && '9' ||
+                  github.event.schedule | split(',')[0] == '5 4' && '12' ||
+                  github.event.schedule | split(',')[0] == '5 7' && '15' ||
+                  github.event.schedule | split(',')[0] == '5 10' && '18'
+              ) || 'manual'
+          }}
         run: python cnas_monitor.py
 
       - name: 提交状态文件更新
