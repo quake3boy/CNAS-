@@ -1,0 +1,40 @@
+name: CNAS培训通知监控
+on:
+  schedule:
+    # 北京时间 8:30 ~ 18:30，每半小时运行一次
+    # 北京时间 = UTC + 8，因此：
+    #   北京 8:30  = UTC 0:30
+    #   北京 18:30 = UTC 10:30
+    # 两条 cron 组合覆盖 0:30~10:30 之间的所有半点和整点：
+    - cron: '30 0-10 * * *'   # UTC 0:30,1:30,...,10:30 → 北京 8:30,9:30,...,18:30
+    - cron: '0 1-10 * * *'    # UTC 1:00,2:00,...,10:00 → 北京 9:00,10:00,...,18:00
+  workflow_dispatch:
+permissions: write-all
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: 安装OCR引擎和依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim poppler-utils
+          pip install requests beautifulsoup4 pytesseract pdf2image
+      - name: 运行监控脚本
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python cnas_monitor.py
+      - name: 提交状态文件更新
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add cnas_monitor_state.json
+          git diff --staged --quiet || git commit -m "更新监控状态 [skip ci]"
+          git push
