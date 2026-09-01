@@ -1,1 +1,53 @@
+name: CNAS培训通知监控
+on:
+  schedule:
+    # 每天北京时间18:30执行 = UTC 10:30
+    - cron: '30 10 * * *'
+  workflow_dispatch:
 
+permissions: write-all
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20          # 放宽到20分钟，确保OCR和邮件都能完成
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 替换apt国内源，加速安装
+        run: |
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+          sudo sed -i 's|http://azure.archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
+          sudo sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
+
+      - name: 安装OCR引擎和依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim poppler-utils
+          pip install requests beautifulsoup4 pytesseract pdf2image
+
+      - name: 运行监控脚本（含每日总结邮件）
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python cnas_monitor.py
+
+      - name: 提交状态文件更新（冲突自动以本次结果为准）
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add cnas_monitor_state.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "更新监控状态 [skip ci]"
+          # 拉取最新代码，冲突时自动用本次运行的版本（theirs策略）
+          git pull origin main --rebase -X theirs 2>/dev/null || git rebase --abort 2>/dev/null || true
+          # 推送，失败也不影响整体任务状态
+          git push origin main 2>/dev/null || git push --force origin main 2>/dev/null || true
+          echo "状态文件提交完成（如有冲突已自动处理）"
