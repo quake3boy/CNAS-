@@ -1,0 +1,68 @@
+name: CNAS培训通知监控
+on:
+  schedule:
+    # 每30分钟唤醒一次（UTC 0:00~11:30 → 北京 8:00~19:30）
+    # 脚本内部控制：仅在 8:30~18:30 窗口内每小时执行一次实际监控
+    # 窗口外的唤醒用于：补发昨日总结邮件、存活检测告警
+    - cron: '*/30 0-11 * * *'
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 替换apt国内源，加速安装
+        run: |
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+          sudo sed -i 's|http://azure.archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
+          sudo sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
+
+      - name: 安装OCR引擎和依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim poppler-utils
+          pip install requests beautifulsoup4 pytesseract pdf2image
+
+      - name: 运行监控脚本
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+        run: python cnas_monitor.py
+
+      - name: 提交状态文件更新
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add cnas_monitor_state.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "状态文件无变化，跳过提交"
+          else
+            git commit -m "更新监控状态 [skip ci]"
+            echo "状态文件已提交"
+          fi
+          # 拉取最新代码，rebase冲突时保留本地版本（本次运行结果）
+          git pull origin main --rebase -X ours 2>&1 || {
+            echo "警告：git pull/rebase 失败，尝试中止rebase"
+            git rebase --abort 2>/dev/null || true
+          }
+          # 推送，失败时输出明确错误（不再静默吞掉，也不再force push）
+          if ! git push origin main 2>&1; then
+            echo "::error::状态文件推送失败！下次运行将使用旧状态，可能导致重复通知或计数不准"
+            echo "请检查仓库权限或手动推送 cnas_monitor_state.json"
+            exit 1
+          fi
+          echo "状态文件推送成功"
