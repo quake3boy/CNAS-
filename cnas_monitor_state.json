@@ -5,7 +5,7 @@
   "total_training_notices_found": 8,
   "last_training_notice_title": "关于举办医疗器械检测实验室认可技术培训的通知",
   "last_training_notice_date": "2026-08-17",
-  "last_summary_date": "2026-09-02",
+  "last_summary_date": "2026-09-03",
   "today_training_found": false,
   "today_check_count": 2,
   "last_error_date": "",
@@ -14,7 +14,7 @@
   "hourly_executed": {
     "16": "2026-09-03 16:34:33"
   },
-  "last_heartbeat": "2026-09-03 16:34:33",
+  "last_heartbeat": "2026-09-03 19:50:32",
   "yesterday_check_count": 0,
   "yesterday_training_list": [],
   "yesterday_date": ""
