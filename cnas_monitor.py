@@ -1,0 +1,994 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CNAS网站最新通知监控脚本 - 增强版
+运行频率：GitHub Actions 每30分钟唤醒一次（由yml cron控制）
+脚本内部控制：
+  - 监控窗口：北京时间 8:30~18:30，每小时执行一次实际检查（每小时去重）
+  - 窗口外唤醒：用于补发昨日总结邮件、存活检测告警、心跳更新
+邮件逻辑：
+  - 窗口内每小时运行时，有新培训通知才发实时通知邮件，无新通知静默
+  - 18:25后首次唤醒必发每日总结邮件（汇总全天检查情况，无论有没有新通知）
+  - 每天首次唤醒时检查：若昨日未发总结，自动补发
+  - 异常时立即发红色紧急报警邮件 + 钉钉通知
+  - 存活检测：监控窗口内超过2小时无运行记录，发送告警
+  - 邮件发送失败时，钉钉机器人自动兜底通知
+"""
+import requests
+from bs4 import BeautifulSoup
+import json
+import os
+import sys
+import traceback
+from datetime import datetime, timezone, timedelta
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
+from email.utils import formataddr
+import io
+import re
+import base64
+import time
+import hashlib
+import hmac
+import urllib.parse
+
+# 邮件配置（从环境变量读取）
+SMTP_SERVER = "smtp.qq.com"
+SMTP_PORT = 465
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "4557034@qq.com")
+SENDER_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
+RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "4557034@qq.com")
+
+# 钉钉机器人 Webhook（从环境变量读取，可选；作为邮件失败兜底）
+DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK", "")
+DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET", "")  # 加签密钥（可选）
+
+# 配置
+CNAS_URL = "https://www.cnas.org.cn/fzlm/tzgg/index.html"
+BASE_URL = "https://www.cnas.org.cn"
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnas_monitor_state.json")
+
+# 北京时间
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+# 监控窗口配置（北京时间）
+WINDOW_START_HOUR = 8
+WINDOW_START_MINUTE = 30
+WINDOW_END_HOUR = 18
+WINDOW_END_MINUTE = 30
+
+# 末班时间阈值（北京时间 >= 18:25 视为今日最后一班，触发每日总结）
+LAST_RUN_HOUR = 18
+LAST_RUN_MINUTE = 25
+
+# 存活检测阈值（秒）：监控窗口内超过此时间无心跳则告警
+HEARTBEAT_TIMEOUT = 2 * 3600  # 2小时
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+}
+
+# OCR相关（延迟导入，避免没有安装时脚本崩溃）
+OCR_AVAILABLE = False
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    print("提示：OCR相关库未安装，将跳过PDF内容识别")
+
+
+# ============================================================
+# 钉钉通知（邮件失败兜底）
+# ============================================================
+def send_dingtalk(text):
+    """发送钉钉机器人文本通知（可选，作为邮件失败兜底）"""
+    if not DINGTALK_WEBHOOK:
+        print("钉钉Webhook未配置，跳过钉钉通知")
+        return False
+    try:
+        webhook = DINGTALK_WEBHOOK
+        # 加签（如果配置了密钥）
+        if DINGTALK_SECRET:
+            timestamp = str(round(time.time() * 1000))
+            string_to_sign = f"{timestamp}\n{DINGTALK_SECRET}"
+            hmac_code = hmac.new(
+                DINGTALK_SECRET.encode("utf-8"),
+                string_to_sign.encode("utf-8"),
+                digestmod=hashlib.sha256
+            ).digest()
+            sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+            webhook = f"{webhook}&timestamp={timestamp}&sign={sign}"
+
+        payload = {
+            "msgtype": "text",
+            "text": {"content": f"【CNAS监控】{text}"}
+        }
+        resp = requests.post(webhook, json=payload, timeout=10)
+        result = resp.json()
+        if result.get("errcode") == 0:
+            print("钉钉通知发送成功")
+            return True
+        else:
+            print(f"钉钉通知发送失败: {result}")
+            return False
+    except Exception as e:
+        print(f"钉钉通知异常: {e}")
+        return False
+
+
+# ============================================================
+# 邮件发送（增强：失败时钉钉兜底）
+# ============================================================
+def send_email(subject, html_body, max_retries=3, dingtalk_fallback=True):
+    """通用邮件发送（带重试机制，最终失败时钉钉兜底）"""
+    if not SENDER_PASSWORD:
+        print("错误：未配置邮箱密码（EMAIL_PASSWORD）")
+        if dingtalk_fallback:
+            send_dingtalk(f"邮箱密码未配置，无法发送邮件！主题：{subject}")
+        return False
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["From"] = formataddr(("CNAS通知监控", SENDER_EMAIL), "utf-8")
+            msg["To"] = RECEIVER_EMAIL
+            msg["Subject"] = Header(subject, "utf-8")
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+            print(f"邮件发送成功（第{attempt}次尝试）")
+            return True
+        except Exception as e:
+            print(f"邮件发送失败（第{attempt}/{max_retries}次）: {e}")
+            if attempt < max_retries:
+                wait_time = attempt * 5
+                print(f"等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+
+    print(f"邮件发送最终失败，已重试 {max_retries} 次")
+    # 钉钉兜底：发送简要文本通知
+    if dingtalk_fallback:
+        plain_text = re.sub(r'<[^>]+>', '', html_body)
+        plain_text = re.sub(r'\s+', ' ', plain_text).strip()[:300]
+        send_dingtalk(f"邮件发送失败！主题：{subject}\n摘要：{plain_text}")
+    return False
+
+
+def image_to_base64(img, quality=80):
+    """PIL图片转base64编码"""
+    buffer = io.BytesIO()
+    img.convert("RGB").save(buffer, format="JPEG", quality=quality)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def extract_pdf_content(pdf_content):
+    """用OCR提取PDF文字内容，同时返回每页图片的base64"""
+    if not OCR_AVAILABLE:
+        return None, [], "OCR工具未安装"
+    try:
+        images = convert_from_bytes(pdf_content, dpi=150)
+        print(f"PDF共 {len(images)} 页，开始OCR识别...")
+        full_text = ""
+        page_images = []
+        for i, img in enumerate(images):
+            print(f"正在识别第 {i+1}/{len(images)} 页...")
+            text = pytesseract.image_to_string(img, lang='chi_sim')
+            if i > 0:
+                full_text += f"\n\n========== 第 {i+1} 页 ==========\n\n"
+            full_text += text
+            img_b64 = image_to_base64(img, quality=75)
+            page_images.append(img_b64)
+            print(f"  第{i+1}页图片大小: {len(img_b64)//1024}KB")
+        full_text = re.sub(r'\n{4,}', '\n\n\n', full_text).strip()
+        print(f"OCR识别完成，共 {len(full_text)} 字，{len(page_images)} 页图片")
+        return full_text, page_images, None
+    except Exception as e:
+        print(f"OCR识别失败: {e}")
+        return None, [], str(e)
+
+
+def extract_key_info(text):
+    """从OCR文本中提取关键信息"""
+    info = {
+        '培训时间': '', '培训地点': '', '培训内容': '', '培训费用': '',
+        '报名方式': '', '联系方式': '', '参加对象': '',
+    }
+    if not text:
+        return info
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    patterns = {
+        '培训时间': [r'培训时间[：:]\s*(.+)', r'时间[：:]\s*(.+)', r'举办时间[：:]\s*(.+)'],
+        '培训地点': [r'培训地点[：:]\s*(.+)', r'地点[：:]\s*(.+)', r'举办地点[：:]\s*(.+)'],
+        '培训内容': [r'培训内容[：:]\s*(.+)', r'内容[：:]\s*(.+)', r'课程内容[：:]\s*(.+)'],
+        '培训费用': [r'培训费用[：:]\s*(.+)', r'费用[：:]\s*(.+)', r'收费[：:]\s*(.+)'],
+        '报名方式': [r'报名方式[：:]\s*(.+)', r'报名[：:]\s*(.+)', r'如何报名[：:]\s*(.+)'],
+        '联系方式': [r'联系方式[：:]\s*(.+)', r'联系电话[：:]\s*(.+)', r'联系人[：:]\s*(.+)', r'电话[：:]\s*(.+)'],
+        '参加对象': [r'参加对象[：:]\s*(.+)', r'培训对象[：:]\s*(.+)', r'对象[：:]\s*(.+)'],
+    }
+    for key, regex_list in patterns.items():
+        for line in lines:
+            for pattern in regex_list:
+                match = re.search(pattern, line)
+                if match:
+                    value = match.group(1).strip()
+                    if value and len(value) > 2:
+                        info[key] = value[:100]
+                        break
+            if info[key]:
+                break
+    return info
+
+
+def get_notice_detail_and_pdf(notice_url):
+    """访问通知详情页，获取PDF附件、OCR内容和原版图片"""
+    result = {
+        'pdf_name': None, 'pdf_url': None, 'pdf_text': None, 'pdf_summary': None,
+        'page_images': [], 'key_info': {}, 'ocr_error': None, 'page_text': None
+    }
+    try:
+        resp = requests.get(notice_url, headers=HEADERS, timeout=30)
+        resp.encoding = 'utf-8'
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        body = soup.find('body')
+        if body:
+            page_text = body.get_text(strip=True)
+            if len(page_text) > 100:
+                result['page_text'] = page_text[:500]
+        for a in soup.find_all('a'):
+            href = a.get('href', '')
+            text = a.get_text(strip=True)
+            if '.pdf' in href.lower() or 'download' in href.lower():
+                result['pdf_name'] = text
+                if href.startswith('/'):
+                    result['pdf_url'] = BASE_URL + href
+                else:
+                    result['pdf_url'] = href
+                break
+        if result['pdf_url'] and OCR_AVAILABLE:
+            print(f"正在下载PDF: {result['pdf_name']}")
+            pdf_resp = requests.get(result['pdf_url'], headers=HEADERS, timeout=60)
+            if pdf_resp.status_code == 200 and len(pdf_resp.content) > 0:
+                print(f"PDF大小: {len(pdf_resp.content)//1024}KB")
+                text, images, error = extract_pdf_content(pdf_resp.content)
+                if text:
+                    result['pdf_text'] = text
+                    result['pdf_summary'] = text
+                    result['page_images'] = images
+                    result['key_info'] = extract_key_info(text)
+                else:
+                    result['ocr_error'] = error
+            else:
+                result['ocr_error'] = f"PDF下载失败，状态码: {pdf_resp.status_code}"
+        return result
+    except Exception as e:
+        print(f"获取通知详情失败: {e}")
+        result['ocr_error'] = str(e)
+        return result
+
+
+def build_training_notice_html(training_notices):
+    """构建培训通知的HTML内容（用于嵌入邮件）"""
+    items_html = ""
+    for i, notice in enumerate(training_notices, 1):
+        title = notice.get("title", "未知标题")
+        date = notice.get("date", "未知日期")
+        url = notice.get("url", "")
+        detail = get_notice_detail_and_pdf(url)
+
+        key_info_html = ""
+        key_info = detail.get('key_info', {})
+        if any(key_info.values()):
+            info_rows = ""
+            for k, v in key_info.items():
+                if v:
+                    info_rows += f"""
+                    <tr>
+                        <td style="padding:6px 10px;font-weight:bold;color:#0369a1;width:90px;vertical-align:top;">{k}</td>
+                        <td style="padding:6px 10px;color:#1e293b;">{v}</td>
+                    </tr>
+                    """
+            key_info_html = f"""
+            <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:14px 18px;margin-top:12px;">
+                <div style="font-weight:bold;color:#1d4ed8;margin-bottom:10px;font-size:14px;">📋 关键信息</div>
+                <table style="width:100%;border-collapse:collapse;font-size:13px;">{info_rows}</table>
+            </div>
+            """
+
+        images_html = ""
+        page_images = detail.get('page_images', [])
+        if page_images:
+            imgs = ""
+            for idx, img_b64 in enumerate(page_images):
+                imgs += f"""
+                <div style="margin-bottom:16px;text-align:center;">
+                    <div style="font-size:12px;color:#6b7280;margin-bottom:6px;">第 {idx+1} 页</div>
+                    <img src="data:image/jpeg;base64,{img_b64}" style="max-width:100%;border:1px solid #e5e7eb;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,0.1);" alt="PDF第{idx+1}页">
+                </div>
+                """
+            images_html = f"""
+            <div style="margin-top:14px;">
+                <div style="font-weight:bold;color:#0369a1;margin-bottom:10px;font-size:14px;">📄 PDF原版内容（共{len(page_images)}页）</div>
+                {imgs}
+            </div>
+            """
+
+        ocr_text_html = ""
+        if detail.get('pdf_summary'):
+            ocr_text_html = f"""
+            <div style="margin-top:14px;">
+                <details style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;">
+                    <summary style="cursor:pointer;font-weight:bold;color:#475569;font-size:13px;">📝 OCR识别文字（共{len(detail['pdf_summary'])}字，点击展开/复制）</summary>
+                    <div style="margin-top:10px;white-space:pre-wrap;word-break:break-all;font-family:'Courier New',monospace;font-size:12px;color:#334155;line-height:1.7;max-height:500px;overflow-y:auto;">{detail['pdf_summary']}</div>
+                </details>
+            </div>
+            """
+        elif detail.get('ocr_error'):
+            ocr_text_html = f"""
+            <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;padding:10px 14px;margin-top:12px;font-size:12px;color:#92400e;">
+                ⚠️ OCR文字识别失败：{detail['ocr_error'][:100]}
+            </div>
+            """
+
+        pdf_info = ""
+        if detail.get('pdf_name'):
+            pdf_info = f'<div style="font-size:12px;color:#6b7280;margin-top:6px;">附件：{detail["pdf_name"]}</div>'
+
+        items_html += f"""
+            <div style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:18px 22px;margin-bottom:20px;border-left:4px solid #3b82f6;">
+                <div style="font-size:17px;font-weight:bold;margin-bottom:8px;">
+                    <a href="{url}" target="_blank" style="color:#1a56db;text-decoration:none;">{i}. {title}</a>
+                </div>
+                <div style="font-size:13px;color:#6b7280;">发布日期：{date}</div>
+                {pdf_info}
+                {key_info_html}
+                {images_html}
+                {ocr_text_html}
+            </div>
+        """
+    return items_html
+
+
+def send_training_notice_email(training_notices):
+    """发送新培训通知实时邮件（关键信息+原版图片+OCR文字）"""
+    count = len(training_notices)
+    latest_date = training_notices[0]["date"]
+    subject = f"【CNAS新培训通知】{count}条新培训通知 - {latest_date}"
+
+    items_html = build_training_notice_html(training_notices)
+
+    html_body = f"""
+    <div style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:720px;margin:0 auto;padding:20px;color:#333;">
+        <div style="background:linear-gradient(135deg,#1a56db,#3b82f6);color:white;padding:22px 30px;border-radius:8px 8px 0 0;">
+            <h1 style="margin:0;font-size:21px;">CNAS 培训通知提醒</h1>
+            <p style="margin:8px 0 0 0;opacity:0.9;font-size:14px;">中国合格评定国家认可委员会 - 最新通知监控</p>
+        </div>
+        <div style="background:#f9fafb;padding:25px 30px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none;">
+            <div style="background:#dbeafe;color:#1e40af;padding:12px 16px;border-radius:6px;margin-bottom:20px;font-weight:bold;">
+                检测到 <strong>{count}</strong> 条新的培训通知
+            </div>
+            {items_html}
+            <div style="margin-top:15px;text-align:center;">
+                <a href="https://www.cnas.org.cn/fzlm/tzgg/index.html" target="_blank" style="color:#6b7280;font-size:13px;">查看完整通知列表 →</a>
+            </div>
+            <div style="margin-top:25px;padding-top:15px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
+                本邮件由CNAS通知监控系统自动发送<br>监控时段：每日 08:30 ~ 18:30，每小时一次<br>
+                PDF原版图片直接嵌入邮件，OCR文字供复制搜索使用
+            </div>
+        </div>
+    </div>
+    """
+
+    print("正在发送新培训通知邮件...")
+    success = send_email(subject, html_body)
+    if success:
+        print(f"新培训通知邮件发送成功！共 {count} 条")
+    return success
+
+
+def send_daily_summary_email(today_check_count, today_training_count=0, training_notices=None, error_msg=None, summary_date=None):
+    """发送每日总结邮件（18:30末班必发，汇总全天情况）"""
+    now = get_beijing_now()
+    if summary_date is None:
+        summary_date = now.strftime("%Y-%m-%d")
+    now_time = now.strftime("%H:%M:%S")
+
+    has_training = training_notices and len(training_notices) > 0
+    has_error = error_msg is not None
+
+    # 邮件标题根据情况变化
+    if has_error:
+        subject = f"🔴【CNAS每日总结】监控异常 - {summary_date}"
+    elif has_training:
+        subject = f"🔵【CNAS每日总结】今日发现{today_training_count}条新培训通知 - {summary_date}"
+    else:
+        subject = f"【CNAS每日总结】今日无新培训通知 - {summary_date}"
+
+    # 状态横幅
+    if has_error:
+        banner_bg = "linear-gradient(135deg,#991b1b,#dc2626)"
+        status_html = f"""
+        <div style="background:#fee2e2;border:2px solid #f87171;color:#991b1b;padding:16px 20px;border-radius:8px;margin-bottom:20px;">
+            <div style="font-size:16px;font-weight:bold;margin-bottom:8px;">⚠️ 末班监控执行异常</div>
+            <p style="margin:0;font-size:14px;">本次末班检查未能正常完成，请查看下方错误详情。</p>
+        </div>
+        """
+    elif has_training:
+        banner_bg = "linear-gradient(135deg,#1a56db,#3b82f6)"
+        status_html = f"""
+        <div style="background:#dbeafe;color:#1e40af;padding:12px 16px;border-radius:6px;margin-bottom:20px;font-weight:bold;">
+            🔵 今日共发现 <strong>{today_training_count}</strong> 条新的培训通知，详情见下方
+        </div>
+        """
+    else:
+        banner_bg = "linear-gradient(135deg,#6b7280,#9ca3af)"
+        status_html = f"""
+        <div style="background:#f3f4f6;color:#374151;padding:12px 16px;border-radius:6px;margin-bottom:20px;font-weight:bold;">
+            ✅ 今日未发现新的培训通知
+        </div>
+        """
+
+    # 培训通知内容（总结邮件中只显示标题列表，不重复OCR全文，避免邮件过大）
+    training_html = ""
+    if has_training:
+        notice_list = ""
+        for i, notice in enumerate(training_notices, 1):
+            title = notice.get("title", "未知标题")
+            date = notice.get("date", "未知日期")
+            url = notice.get("url", "")
+            notice_list += f"""
+            <div style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
+                <div style="font-size:14px;font-weight:bold;color:#1e40af;">
+                    <a href="{url}" target="_blank" style="color:#1a56db;text-decoration:none;">{i}. {title}</a>
+                </div>
+                <div style="font-size:12px;color:#6b7280;margin-top:4px;">发布日期：{date}</div>
+            </div>
+            """
+        training_html = f"""
+        <div style="margin-top:20px;">
+            <div style="font-size:16px;font-weight:bold;color:#1e40af;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid #bfdbfe;">
+                📢 今日新培训通知汇总（共{len(training_notices)}条）
+            </div>
+            <div style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:14px 18px;">
+                {notice_list}
+            </div>
+            <div style="font-size:12px;color:#6b7280;margin-top:8px;">
+                注：新通知的完整内容（PDF原版图片+OCR文字）已在发现时单独发送实时邮件
+            </div>
+        </div>
+        """
+
+    # 错误详情
+    error_html = ""
+    if has_error:
+        error_html = f"""
+        <div style="margin-top:20px;">
+            <div style="font-size:16px;font-weight:bold;color:#991b1b;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid #fca5a5;">
+                ❌ 错误详情
+            </div>
+            <div style="background:#1f2937;color:#fca5a5;padding:15px;border-radius:6px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;border:1px solid #374151;">{error_msg}</div>
+        </div>
+        """
+
+    html_body = f"""
+    <div style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:720px;margin:0 auto;padding:20px;color:#333;">
+        <div style="background:{banner_bg};color:white;padding:22px 30px;border-radius:8px 8px 0 0;">
+            <h1 style="margin:0;font-size:21px;">CNAS 每日监控总结</h1>
+            <p style="margin:8px 0 0 0;opacity:0.9;font-size:14px;">中国合格评定国家认可委员会 - 通知监控日报</p>
+        </div>
+        <div style="background:#f9fafb;padding:25px 30px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none;">
+            {status_html}
+
+            <div style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
+                <div style="font-size:16px;font-weight:bold;margin-bottom:12px;color:#374151;">📊 今日监控概况</div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px solid #f3f4f6;">
+                    <span style="color:#6b7280;">监控日期</span><span style="font-weight:bold;">{summary_date}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px solid #f3f4f6;">
+                    <span style="color:#6b7280;">末班执行时间</span><span style="font-weight:bold;">{now_time} (北京时间)</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px solid #f3f4f6;">
+                    <span style="color:#6b7280;">今日检查次数</span><span style="font-weight:bold;">{today_check_count} 次</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;">
+                    <span style="color:#6b7280;">新培训通知</span>
+                    <span style="font-weight:bold;color:{'#059669' if not has_training else '#2563eb'};">
+                        {'无' if not has_training else str(today_training_count) + ' 条'}
+                    </span>
+                </div>
+            </div>
+
+            {training_html}
+            {error_html}
+
+            <div style="margin-top:20px;text-align:center;">
+                <a href="https://www.cnas.org.cn/fzlm/tzgg/index.html" target="_blank" style="color:#6b7280;font-size:13px;">前往CNAS官网查看全部通知 →</a>
+            </div>
+            <div style="margin-top:25px;padding-top:15px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
+                本邮件由CNAS通知监控系统自动发送<br>每日北京时间 08:30~18:30 每小时监控，18:30后发送每日总结<br>
+                有新培训通知时立即发送实时通知邮件，含PDF原版图片+OCR文字
+            </div>
+        </div>
+    </div>
+    """
+
+    print("正在发送每日总结邮件...")
+    success = send_email(subject, html_body)
+    if success:
+        print("每日总结邮件发送成功！")
+    return success
+
+
+def send_error_email(error_message):
+    """发送异常提醒邮件（醒目红色，每次异常立即发送）"""
+    now = get_beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    subject = f"🔴【紧急】CNAS监控异常 - 自动任务运行失败 - {now}"
+    html_body = f"""
+    <div style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;color:#333;">
+        <div style="background:linear-gradient(135deg,#991b1b,#dc2626);color:white;padding:24px 30px;border-radius:8px 8px 0 0;border:3px solid #7f1d1d;">
+            <h1 style="margin:0;font-size:22px;color:#fff;">🔴 紧急：CNAS监控异常</h1>
+            <p style="margin:10px 0 0 0;opacity:0.95;font-size:15px;color:#fecaca;">自动任务运行失败，请立即检查！</p>
+        </div>
+        <div style="background:#fef2f2;padding:25px 30px;border-radius:0 0 8px 8px;border:2px solid #fca5a5;border-top:none;">
+            <div style="background:#fee2e2;border:2px solid #f87171;color:#991b1b;padding:18px 22px;border-radius:8px;margin-bottom:20px;">
+                <div style="font-size:18px;font-weight:bold;margin-bottom:8px;">⚠️ 监控执行失败</div>
+                <p style="margin:0;font-size:14px;">本次监控检查未能正常完成，自动任务可能已停止运行，请立即前往GitHub Actions页面查看详细日志并排查问题。</p>
+            </div>
+            <p style="color:#7f1d1d;font-size:14px;font-weight:bold;">错误时间：<span style="color:#991b1b;">{now}</span></p>
+            <p style="color:#7f1d1d;font-size:14px;margin-top:15px;font-weight:bold;">错误详情：</p>
+            <div style="background:#1f2937;color:#fca5a5;padding:15px;border-radius:6px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;border:1px solid #374151;">{error_message}</div>
+            <div style="margin-top:20px;padding:12px 16px;background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;font-size:13px;color:#92400e;">
+                <strong>排查建议：</strong>前往仓库 → Actions → 点击失败的运行记录 → 查看"运行监控脚本"步骤的详细日志
+            </div>
+            <div style="margin-top:25px;padding-top:15px;border-top:1px solid #fca5a5;font-size:12px;color:#b91c1c;text-align:center;font-weight:bold;">
+                本邮件由CNAS通知监控系统自动发送 · 每次异常都会立即提醒
+            </div>
+        </div>
+    </div>
+    """
+    print("正在发送异常提醒邮件（紧急红色）...")
+    success = send_email(subject, html_body)
+    if success:
+        print("异常提醒邮件发送成功！")
+    return success
+
+
+# ============================================================
+# 昨日总结补发
+# ============================================================
+def send_yesterday_summary(state):
+    """检查并补发昨日的总结邮件（如果昨天没发）"""
+    now = get_beijing_now()
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    last_summary = state.get("last_summary_date", "")
+
+    if last_summary == yesterday:
+        print(f"昨日({yesterday})总结邮件已发送，无需补发")
+        return False
+
+    # 从归档中取昨天的数据（新的一天时已归档）
+    yesterday_check_count = state.get("yesterday_check_count", 0)
+    yesterday_training_list = state.get("yesterday_training_list", [])
+    yesterday_training_count = len(yesterday_training_list)
+    yesterday_date_recorded = state.get("yesterday_date", "")
+
+    print(f"检测到昨日({yesterday})未发送总结邮件，正在补发...")
+
+    subject = f"⚠️【补发】CNAS每日总结 - {yesterday}（昨日任务异常，今日补发）"
+
+    has_training = yesterday_training_count > 0
+    banner_bg = "linear-gradient(135deg,#b45309,#f59e0b)" if not has_training else "linear-gradient(135deg,#1a56db,#3b82f6)"
+
+    training_html = ""
+    if has_training:
+        notice_list = ""
+        for i, notice in enumerate(yesterday_training_list, 1):
+            title = notice.get("title", "未知标题")
+            date = notice.get("date", "未知日期")
+            url = notice.get("url", "")
+            notice_list += f"""
+            <div style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
+                <div style="font-size:14px;font-weight:bold;color:#1e40af;">
+                    <a href="{url}" target="_blank" style="color:#1a56db;text-decoration:none;">{i}. {title}</a>
+                </div>
+                <div style="font-size:12px;color:#6b7280;margin-top:4px;">发布日期：{date}</div>
+            </div>
+            """
+        training_html = f"""
+        <div style="margin-top:20px;">
+            <div style="font-size:16px;font-weight:bold;color:#1e40af;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid #bfdbfe;">
+                📢 昨日新培训通知汇总（共{yesterday_training_count}条）
+            </div>
+            <div style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:14px 18px;">
+                {notice_list}
+            </div>
+        </div>
+        """
+
+    html_body = f"""
+    <div style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:720px;margin:0 auto;padding:20px;color:#333;">
+        <div style="background:{banner_bg};color:white;padding:22px 30px;border-radius:8px 8px 0 0;">
+            <h1 style="margin:0;font-size:21px;">⚠️ CNAS 每日监控总结（补发）</h1>
+            <p style="margin:8px 0 0 0;opacity:0.9;font-size:14px;">{yesterday} 的总结邮件因定时任务异常未按时发送，今日自动补发</p>
+        </div>
+        <div style="background:#f9fafb;padding:25px 30px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;border-top:none;">
+            <div style="background:#fef3c7;color:#92400e;padding:12px 16px;border-radius:6px;margin-bottom:20px;font-weight:bold;font-size:13px;">
+                ⚠️ 此为补发邮件。昨日 GitHub Actions 定时任务可能被跳过或延迟，导致总结邮件未按时发送。
+            </div>
+            <div style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
+                <div style="font-size:16px;font-weight:bold;margin-bottom:12px;color:#374151;">📊 昨日监控概况</div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px solid #f3f4f6;">
+                    <span style="color:#6b7280;">监控日期</span><span style="font-weight:bold;">{yesterday}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px solid #f3f4f6;">
+                    <span style="color:#6b7280;">记录检查次数</span><span style="font-weight:bold;">{yesterday_check_count} 次{'（可能不完整）' if yesterday_date_recorded != yesterday else ''}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;">
+                    <span style="color:#6b7280;">新培训通知</span>
+                    <span style="font-weight:bold;color:{'#059669' if not has_training else '#2563eb'};">
+                        {'无' if not has_training else str(yesterday_training_count) + ' 条'}
+                    </span>
+                </div>
+            </div>
+            {training_html}
+            <div style="margin-top:25px;padding-top:15px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;text-align:center;">
+                本邮件由CNAS通知监控系统自动补发<br>
+                建议检查 GitHub Actions 运行记录，确认定时任务是否正常
+            </div>
+        </div>
+    </div>
+    """
+
+    success = send_email(subject, html_body)
+    if success:
+        state["last_summary_date"] = yesterday
+        print(f"昨日({yesterday})总结邮件补发成功")
+    else:
+        print(f"昨日({yesterday})总结邮件补发失败")
+    return success
+
+
+# ============================================================
+# 存活检测
+# ============================================================
+def check_heartbeat(state, now):
+    """存活检测：监控窗口内超过阈值无心跳则告警"""
+    last_heartbeat_str = state.get("last_heartbeat", "")
+    if not last_heartbeat_str:
+        return False
+
+    try:
+        last_heartbeat = datetime.strptime(last_heartbeat_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ)
+        gap = (now - last_heartbeat).total_seconds()
+
+        if gap > HEARTBEAT_TIMEOUT and is_in_monitor_window(now):
+            gap_hours = gap / 3600
+            print(f"⚠️ 存活检测告警：距离上次运行已 {gap_hours:.1f} 小时，超过阈值 {HEARTBEAT_TIMEOUT/3600} 小时")
+
+            alert_text = f"🔴 存活告警：监控窗口内已 {gap_hours:.1f} 小时无运行记录（上次：{last_heartbeat_str}），定时任务可能异常，请检查GitHub Actions"
+            send_dingtalk(alert_text)
+
+            subject = f"🔴【紧急】CNAS监控存活告警 - 任务可能已停止 - {now.strftime('%Y-%m-%d %H:%M')}"
+            html_body = f"""
+            <div style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;color:#333;">
+                <div style="background:linear-gradient(135deg,#991b1b,#dc2626);color:white;padding:24px 30px;border-radius:8px 8px 0 0;">
+                    <h1 style="margin:0;font-size:22px;">🔴 存活检测告警</h1>
+                    <p style="margin:10px 0 0 0;opacity:0.95;font-size:15px;">监控任务可能已停止运行</p>
+                </div>
+                <div style="background:#fef2f2;padding:25px 30px;border-radius:0 0 8px 8px;border:2px solid #fca5a5;border-top:none;">
+                    <div style="background:#fee2e2;border:2px solid #f87171;color:#991b1b;padding:18px 22px;border-radius:8px;margin-bottom:20px;">
+                        <div style="font-size:16px;font-weight:bold;margin-bottom:8px;">⚠️ 监控窗口内长时间无运行记录</div>
+                        <p style="margin:0;font-size:14px;">在监控时段（8:30~18:30）内，距离上次成功运行已超过 <strong>{gap_hours:.1f} 小时</strong>，定时任务可能被 GitHub Actions 跳过或出现异常。</p>
+                    </div>
+                    <p style="color:#7f1d1d;font-size:14px;"><strong>上次运行时间：</strong>{last_heartbeat_str}</p>
+                    <p style="color:#7f1d1d;font-size:14px;margin-top:10px;"><strong>当前时间：</strong>{now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</p>
+                    <p style="color:#7f1d1d;font-size:14px;margin-top:10px;"><strong>时间间隔：</strong>{gap_hours:.1f} 小时</p>
+                    <div style="margin-top:20px;padding:12px 16px;background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;font-size:13px;color:#92400e;">
+                        <strong>排查建议：</strong>
+                        <ol style="margin:8px 0 0 0;padding-left:20px;">
+                            <li>前往仓库 → Actions，检查最近的 workflow 运行记录</li>
+                            <li>确认 cron 定时任务是否被 GitHub 跳过（常见于免费仓库高峰期）</li>
+                            <li>检查仓库 Actions 配额是否用完</li>
+                            <li>如有必要，手动触发一次 workflow_dispatch</li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+            """
+            send_email(subject, html_body, dingtalk_fallback=False)
+            return True
+    except Exception as e:
+        print(f"存活检测异常: {e}")
+    return False
+
+
+# ============================================================
+# 时间窗口判断
+# ============================================================
+def get_beijing_now():
+    """获取北京时间"""
+    return datetime.now(BEIJING_TZ)
+
+
+def is_in_monitor_window(now):
+    """判断当前时间是否在监控窗口内（8:30~18:30）"""
+    minutes = now.hour * 60 + now.minute
+    start = WINDOW_START_HOUR * 60 + WINDOW_START_MINUTE
+    end = WINDOW_END_HOUR * 60 + WINDOW_END_MINUTE
+    return start <= minutes <= end
+
+
+def is_last_run_time(now):
+    """判断是否到达末班时间（>= 18:25）"""
+    return (now.hour > LAST_RUN_HOUR) or \
+           (now.hour == LAST_RUN_HOUR and now.minute >= LAST_RUN_MINUTE)
+
+
+def _send_daily_summary(state, today, now, error_msg=None):
+    """从state中提取数据并发送每日总结邮件"""
+    today_training_list = state.get("today_training_list", [])
+    if send_daily_summary_email(
+        today_check_count=state.get("today_check_count", 0),
+        today_training_count=len(today_training_list),
+        training_notices=today_training_list if today_training_list else None,
+        error_msg=error_msg,
+        summary_date=today
+    ):
+        state["last_summary_date"] = today
+
+
+# ============================================================
+# 数据抓取与状态管理
+# ============================================================
+def fetch_notices():
+    """抓取CNAS最新通知列表"""
+    api_url = f"{BASE_URL}/api-gateway/jpaas-publish-server/front/page/build/unit"
+    params = {
+        'webId': 'xNSh0kRFc29hohzrU7kOo',
+        'tplSetId': '5HIezOGD1ZzgJVquDdGkh',
+        'pageType': 'column',
+        'tagId': '信息列表',
+        'pageId': 'kPrBsDZPk4zg36138g1ps',
+        'parseType': 'bulidstatic',
+    }
+    api_headers = HEADERS.copy()
+    api_headers['Accept'] = 'application/json, text/javascript, */*; q=0.01'
+    api_headers['X-Requested-With'] = 'XMLHttpRequest'
+    api_headers['Referer'] = CNAS_URL
+    response = requests.get(api_url, headers=api_headers, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get('success'):
+        raise Exception(f"API返回失败: {data.get('message')}")
+    html_content = data.get('data', {}).get('html', '')
+    if not html_content:
+        raise Exception("API返回的HTML内容为空")
+    soup = BeautifulSoup(html_content, "html.parser")
+    notices = []
+    for li in soup.find_all("li"):
+        a_tag = li.find("a")
+        span_tag = li.find("span")
+        if a_tag and span_tag:
+            title = a_tag.get_text(strip=True)
+            href = a_tag.get("href", "")
+            date_text = span_tag.get_text(strip=True)
+            if title and date_text:
+                full_url = BASE_URL + href if href.startswith("/") else href
+                notices.append({"title": title, "date": date_text, "url": full_url})
+    return notices[:20]
+
+
+def load_state():
+    """加载状态文件"""
+    default = {
+        "last_check_time": "", "latest_notice_title": "", "latest_notice_date": "",
+        "total_training_notices_found": 0, "last_training_notice_title": "",
+        "last_training_notice_date": "", "last_summary_date": "",
+        "today_training_found": False, "today_check_count": 0,
+        "today_training_list": [],
+        "last_error_date": "", "last_error_time": "",
+        # 新增字段
+        "hourly_executed": {},       # 每小时执行记录 {"8": "2026-09-03 08:30:00", ...}
+        "last_heartbeat": "",         # 上次心跳时间（每次唤醒都更新）
+        "yesterday_check_count": 0,   # 昨日检查次数（归档）
+        "yesterday_training_list": [], # 昨日培训通知列表（归档）
+        "yesterday_date": "",          # 昨日归档对应的日期
+    }
+    if not os.path.exists(STATE_FILE):
+        return default
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+            for k, v in default.items():
+                if k not in state:
+                    state[k] = v
+            return state
+    except Exception as e:
+        print(f"读取状态文件失败: {e}")
+        return default
+
+
+def save_state(state):
+    """保存状态文件"""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    print("状态文件已更新")
+
+
+def find_new_notices(current_notices, last_title):
+    """找出新通知"""
+    if not last_title:
+        return current_notices[:5]
+    new_notices = []
+    for notice in current_notices:
+        if notice["title"] == last_title:
+            break
+        new_notices.append(notice)
+    return new_notices
+
+
+def filter_training_notices(notices):
+    """筛选培训通知"""
+    keywords = ["培训", "宣贯", "学习班", "研修班", "讲座"]
+    return [n for n in notices if any(k in n["title"] for k in keywords)]
+
+
+# ============================================================
+# 主流程（增强版）
+# ============================================================
+def main():
+    print("=" * 50)
+    now = get_beijing_now()
+    print(f"CNAS通知监控 - {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+    print(f"OCR功能: {'已启用' if OCR_AVAILABLE else '未启用'}")
+    print(f"钉钉通知: {'已配置' if DINGTALK_WEBHOOK else '未配置'}")
+    print("=" * 50)
+
+    today = now.strftime("%Y-%m-%d")
+    state = load_state()
+
+    # ===== 1. 存活检测 =====
+    check_heartbeat(state, now)
+
+    # ===== 2. 新的一天：数据归档 + 补发昨日总结 =====
+    last_check_date = state.get("last_check_time", "")[:10] if state.get("last_check_time") else ""
+    if last_check_date != today:
+        print(f"\n=== 新的一天（{today}），数据归档 ===")
+        # 将今天的统计数据归档为"昨天"（用于补发）
+        state["yesterday_check_count"] = state.get("today_check_count", 0)
+        state["yesterday_training_list"] = state.get("today_training_list", [])
+        state["yesterday_date"] = last_check_date
+
+        # 重置今日统计
+        state["today_training_found"] = False
+        state["today_check_count"] = 0
+        state["today_training_list"] = []
+        state["hourly_executed"] = {}
+
+        # 补发昨日总结邮件
+        print("\n=== 检查是否需要补发昨日总结邮件 ===")
+        send_yesterday_summary(state)
+
+    # ===== 3. 更新心跳时间（每次唤醒都更新） =====
+    state["last_heartbeat"] = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ===== 4. 判断是否在监控窗口内 =====
+    in_window = is_in_monitor_window(now)
+    current_hour = now.hour
+    hourly_executed = state.get("hourly_executed", {})
+
+    if not in_window:
+        print(f"\n当前时间 {now.strftime('%H:%M')} 不在监控窗口（{WINDOW_START_HOUR}:{WINDOW_START_MINUTE:02d}~{WINDOW_END_HOUR}:{WINDOW_END_MINUTE:02d}）内")
+        # 窗口外仍需检查末班总结（如果18:30的唤醒被跳过，19:00的唤醒应该触发总结）
+        if is_last_run_time(now) and state.get("last_summary_date") != today:
+            print("\n=== 已过末班时间且今日未发总结，发送每日总结邮件 ===")
+            _send_daily_summary(state, today, now)
+        else:
+            print("无需发送总结，仅更新心跳")
+        save_state(state)
+        print("\n本次唤醒完成（窗口外，仅心跳+补发检查）")
+        return
+
+    # ===== 5. 每小时去重：当前小时是否已执行过 =====
+    hour_key = str(current_hour)
+    if hourly_executed.get(hour_key):
+        print(f"\n当前小时 {current_hour}:00 已执行过监控（{hourly_executed[hour_key]}），跳过实际检查")
+        # 但仍需检查末班总结
+        if is_last_run_time(now) and state.get("last_summary_date") != today:
+            print("\n=== 已过末班时间，发送每日总结邮件 ===")
+            _send_daily_summary(state, today, now)
+        save_state(state)
+        return
+
+    print(f"\n当前小时 {current_hour}:00 未执行过，开始监控...")
+
+    # ===== 6. 执行实际监控 =====
+    try:
+        print(f"上次检查时间: {state.get('last_check_time', '首次运行')}")
+        print(f"上次最新通知: {state.get('latest_notice_title', '无')}")
+
+        print("\n正在抓取CNAS最新通知...")
+        notices = fetch_notices()
+        if not notices:
+            raise Exception("未能获取通知列表（返回为空）")
+
+        print(f"获取到 {len(notices)} 条通知")
+        print(f"最新通知: {notices[0]['title']} ({notices[0]['date']})")
+
+        new_notices = find_new_notices(notices, state.get("latest_notice_title", ""))
+        if not new_notices:
+            print("\n没有新通知")
+        else:
+            print(f"\n发现 {len(new_notices)} 条新通知")
+            training_notices = filter_training_notices(new_notices)
+            if training_notices:
+                print(f"其中 {len(training_notices)} 条是培训通知，将获取PDF内容并发送实时邮件")
+                if send_training_notice_email(training_notices):
+                    state["total_training_notices_found"] += len(training_notices)
+                    state["last_training_notice_title"] = training_notices[0]["title"]
+                    state["last_training_notice_date"] = training_notices[0]["date"]
+                    state["today_training_found"] = True
+                    existing_list = state.get("today_training_list", [])
+                    for tn in training_notices:
+                        if not any(e["title"] == tn["title"] for e in existing_list):
+                            existing_list.append(tn)
+                    state["today_training_list"] = existing_list
+            else:
+                print("\n新通知中没有培训通知")
+
+        # 更新状态
+        state["last_check_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state["latest_notice_title"] = notices[0]["title"]
+        state["latest_notice_date"] = notices[0]["date"]
+        state["today_check_count"] = state.get("today_check_count", 0) + 1
+        hourly_executed[hour_key] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state["hourly_executed"] = hourly_executed
+
+        # ===== 7. 末班总结邮件 =====
+        if is_last_run_time(now):
+            if state.get("last_summary_date") != today:
+                print("\n=== 今日末班，发送每日总结邮件 ===")
+                _send_daily_summary(state, today, now)
+            else:
+                print("\n今日总结邮件已发送，跳过")
+
+        save_state(state)
+        print("\n监控完成！")
+
+    except Exception as e:
+        error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
+        print(f"\n监控执行异常: {e}")
+        traceback.print_exc()
+
+        state["last_error_date"] = today
+        state["last_error_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state["last_check_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state["today_check_count"] = state.get("today_check_count", 0) + 1
+        hourly_executed[hour_key] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state["hourly_executed"] = hourly_executed
+
+        # 异常时立即发紧急红色邮件 + 钉钉
+        print("\n=== 检测到异常，立即发送紧急红色邮件 + 钉钉通知 ===")
+        send_error_email(error_msg)
+        send_dingtalk(f"监控异常：{str(e)[:200]}")
+
+        # 末班异常也尝试发总结
+        if is_last_run_time(now) and state.get("last_summary_date") != today:
+            print("\n=== 末班异常，尝试发送含错误信息的总结邮件 ===")
+            try:
+                _send_daily_summary(state, today, now, error_msg=error_msg)
+            except Exception as mail_e:
+                print(f"发送总结邮件失败: {mail_e}")
+
+        save_state(state)
+
+
+if __name__ == "__main__":
+    main()
