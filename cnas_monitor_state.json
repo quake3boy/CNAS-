@@ -1,5 +1,5 @@
 {
-  "last_check_time": "2026-09-03 16:34:33",
+  "last_check_time": "2026-09-04 10:12:36",
   "latest_notice_title": "关于发布CNAS-TRL-026:2026《煤炭检测领域实验室内部质量控制方法》、CNAS-TRL-027:2026《煤炭检测实验室测量设备的计量溯源及核查指南》文件的通知",
   "latest_notice_date": "2026-08-28",
   "total_training_notices_found": 8,
@@ -7,15 +7,15 @@
   "last_training_notice_date": "2026-08-17",
   "last_summary_date": "2026-09-03",
   "today_training_found": false,
-  "today_check_count": 2,
+  "today_check_count": 1,
   "last_error_date": "",
   "last_error_time": "",
   "today_training_list": [],
   "hourly_executed": {
-    "16": "2026-09-03 16:34:33"
+    "10": "2026-09-04 10:12:36"
   },
-  "last_heartbeat": "2026-09-03 21:08:47",
-  "yesterday_check_count": 0,
+  "last_heartbeat": "2026-09-04 10:12:36",
+  "yesterday_check_count": 2,
   "yesterday_training_list": [],
-  "yesterday_date": ""
+  "yesterday_date": "2026-09-03"
 }
